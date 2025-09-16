@@ -22,6 +22,10 @@
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithCustomToken, onAuthStateChanged, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, setDoc, doc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+
+        // Configurar el nivel de registro de Firebase para depuración
+        setLogLevel('debug');
 
         window.firebase = {
             initializeApp,
@@ -47,11 +51,11 @@
     <!-- Se cambió el tipo a "text/babel" para que Babel procese el código JSX -->
     <script type="text/babel">
         // ==========================================
-        // Variables de configuración de Firebase
+        // CONFIGURACIÓN DE FIREBASE
         // ==========================================
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
         // ==========================================
         // Helpers
@@ -523,40 +527,64 @@
 
             const [db, setDb] = React.useState(null);
             const [auth, setAuth] = React.useState(null);
+            const [isFirebaseEnabled, setIsFirebaseEnabled] = React.useState(false);
 
             const [estado, setEstado] = React.useState({});
 
             React.useEffect(() => {
-                const { initializeApp, getAuth, signInWithCustomToken, onAuthStateChanged, signInAnonymously, getFirestore } = window.firebase;
-                const app = initializeApp(firebaseConfig);
-                const firestoreDb = getFirestore(app);
-                const firebaseAuth = getAuth(app);
-                setDb(firestoreDb);
-                setAuth(firebaseAuth);
+                const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore } = window.firebase;
+                
+                if (Object.keys(firebaseConfig).length > 0) {
+                    try {
+                        const app = initializeApp(firebaseConfig);
+                        const firestoreDb = getFirestore(app);
+                        const firebaseAuth = getAuth(app);
+                        setDb(firestoreDb);
+                        setAuth(firebaseAuth);
+                        setIsFirebaseEnabled(true);
 
-                const unsubAuth = onAuthStateChanged(firebaseAuth, async (user) => {
-                    if (user) {
-                        setUserId(user.uid);
-                    } else {
-                        try {
-                            const signInPromise = initialAuthToken
-                                ? signInWithCustomToken(firebaseAuth, initialAuthToken)
-                                : signInAnonymously(firebaseAuth);
-                            const userCredential = await signInPromise;
-                            setUserId(userCredential.user.uid);
-                        } catch (e) {
-                            setError('Error de autenticación');
-                            console.error(e);
-                        }
+                        // Lógica de autenticación corregida
+                        const authenticate = async () => {
+                            if (initialAuthToken) {
+                                try {
+                                    await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                                    console.log('Signed in with custom token.');
+                                } catch (e) {
+                                    console.error('Error signing in with custom token, falling back to anonymous:', e);
+                                    await signInAnonymously(firebaseAuth);
+                                }
+                            } else {
+                                await signInAnonymously(firebaseAuth);
+                                console.log('Signed in anonymously.');
+                            }
+                        };
+
+                        const unsubAuth = onAuthStateChanged(firebaseAuth, (user) => {
+                            if (user) {
+                                setUserId(user.uid);
+                            } else {
+                                setUserId(null);
+                            }
+                            setIsAuthReady(true);
+                        });
+                        
+                        authenticate();
+
+                        return () => unsubAuth();
+
+                    } catch (e) {
+                        setError('Error al inicializar Firebase. Las funciones de colaboración están deshabilitadas.');
+                        console.error('Firebase initialization error:', e);
+                        setIsAuthReady(true);
                     }
+                } else {
+                    setError('Las funciones de colaboración en tiempo real están deshabilitadas. La aplicación seguirá funcionando con datos estáticos.');
                     setIsAuthReady(true);
-                });
-
-                return () => unsubAuth();
+                }
             }, []);
 
             React.useEffect(() => {
-                if (!isAuthReady || !userId || !db) return;
+                if (!isAuthReady || !userId || !db || !isFirebaseEnabled) return;
                 const { collection, onSnapshot, doc, setDoc } = window.firebase;
                 const sharedDataCol = collection(db, "artifacts", appId, "public", "data", "medidas_por_alumno");
 
@@ -579,7 +607,7 @@
                 });
 
                 return () => unsubscribe();
-            }, [isAuthReady, userId, db, appId]);
+            }, [isAuthReady, userId, db, appId, isFirebaseEnabled]);
 
             React.useEffect(() => {
                 const load = async () => {
@@ -616,8 +644,8 @@
             const getAlumnoEstado = (id) => estado[id] ?? { alumnoId: id, medidas: [] };
 
             const upsertAlumnoEstado = (alumnoId, updater) => {
-                if (!db) {
-                    setError("Base de datos no disponible.");
+                if (!isFirebaseEnabled || !db) {
+                    setError("Base de datos no disponible. Los cambios no se guardarán.");
                     return;
                 }
                 const { doc, setDoc } = window.firebase;
