@@ -30,9 +30,9 @@ const STORAGE_KEY = "medidas_estado_v1";
 const ENDPOINT_KEY = "gs_endpoint";
 const INLINE_JSON_KEY = "gs_inline_json"; // pruebas locales
 const APIKEY_KEY = "gs_api_key"; // clave opcional
-// Defaults de autorrelleno
-const DEFAULT_ENDPOINT = "";
-const DEFAULT_API_KEY = "";
+// Defaults de autorrelleno. ¡Pon aquí tu URL y tu clave!
+const DEFAULT_ENDPOINT = "https://script.google.com/macros/s/AKfycbx4GKOsA39sqYJolZk0NTKsx9XdsOU6Zh24In5HTmiK5WQz4YLBT4DrJ1mRndybng9T1g/exec";
+const DEFAULT_API_KEY = "d9a66cf3-791d-451b-ac5b-656470328138";
 
 function usePersistedState<T>(key: string, initial: T) {
   const [state, setState] = useState<T>(() => {
@@ -634,6 +634,8 @@ export default function AppMedidas() {
   const [medidas, setMedidas] = useState<{ id: string; nombre: string; descripcion?: string }[]>([]);
   const [clases, setClases] = useState<Clase[]>([]);
   const [endpointError, setEndpointError] = useState<string>("");
+  
+  // Usamos los valores por defecto del código si no hay nada en el almacenamiento local
   const [endpoint, setEndpoint] = useState<string>(() => {
     try {
       return localStorage.getItem(ENDPOINT_KEY) || DEFAULT_ENDPOINT;
