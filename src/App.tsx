@@ -541,7 +541,8 @@ function TarjetasAlumnos({
                   {medidasActivas.map((medida) => (
                     <li key={medida.id} className="border border-indigo-200 bg-indigo-50 rounded-lg p-2">
                       <div className="flex items-center justify-between">
-                        <div className="flex items-center font-medium">
+                        {/* Cambio de estilo para el nombre de la medida */}
+                        <div className="flex items-center font-medium text-sm">
                           <GreenDot />
                           {medida.nombre}
                         </div>
@@ -553,7 +554,6 @@ function TarjetasAlumnos({
                       {medida.comentarios.length > 0 && (
                         <div className="mt-2 text-sm text-gray-700 space-y-1">
                           {medida.comentarios.map((c) => (
-                            // Cambio: se usa `text-xs` para el texto del comentario y `text-xs text-gray-400` para la fecha.
                             <p key={c.id}>
                               <span className="text-xs text-gray-400 font-semibold">{fmtFecha(c.fechaISO)}:</span> <span className="text-xs">{c.texto}</span>
                             </p>
@@ -759,7 +759,6 @@ export default function AppMedidas() {
   };
 
   return (
-    // Cambio: Se utiliza un degradado más colorido para el fondo.
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-purple-50 p-4 sm:p-8">
       <div className="mx-auto max-w-7xl space-y-6">
         {/* Top bar */}
