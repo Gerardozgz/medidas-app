@@ -1,15 +1,4 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot, collection } from 'firebase/firestore';
-
-// ==========================================
-// Variables de configuración de Firebase
-// ==========================================
-// Estas variables son proporcionadas automáticamente por el entorno de Canvas.
-declare const __app_id: string;
-declare const __firebase_config: string;
-declare const __initial_auth_token: string;
 
 // ==========================================
 // Tipos
@@ -37,8 +26,30 @@ const uuid = () =>
     ? (globalThis as any).crypto.randomUUID()
     : `id-${Math.random().toString(36).slice(2)}${Date.now()}`;
 
-const ENDPOINT = "https://script.google.com/macros/s/AKfycbx4GKOsA39sqYJolZk0NTKsx9XdsOU6Zh24In5HTmiK5WQz4YLBT4DrJ1mRndybng9T1g/exec";
-const API_KEY = "d9a66cf3-791d-451b-ac5b-656470328138";
+const STORAGE_KEY = "medidas_estado_v1";
+const ENDPOINT_KEY = "gs_endpoint";
+const INLINE_JSON_KEY = "gs_inline_json"; // pruebas locales
+const APIKEY_KEY = "gs_api_key"; // clave opcional
+// Defaults de autorrelleno. ¡Pon aquí tu URL y tu clave!
+const DEFAULT_ENDPOINT = "https://script.google.com/macros/s/AKfycbx4GKOsA39sqYJolZk0NTKsx9XdsOU6Zh24In5HTmiK5WQz4YLBT4DrJ1mRndybng9T1g/exec";
+const DEFAULT_API_KEY = "d9a66cf3-791d-451b-ac5b-656470328138";
+
+function usePersistedState<T>(key: string, initial: T) {
+  const [state, setState] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? (JSON.parse(raw) as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(state));
+    } catch {}
+  }, [key, state]);
+  return [state, setState] as const;
+}
 
 // ==========================================
 // Lógica pura
@@ -156,12 +167,84 @@ function parseStrictData(data: any): { clases: Clase[]; medidas: { id: string; n
 }
 
 // ==========================================
-// Sincronización con Google Sheets (POST)
+// Carga/Guardado remotos (fetch + JSONP fallback para GET)
 // ==========================================
-async function postAccion(payload: Record<string, string>) {
+function jsonpFetch(url: string, timeoutMs = 8000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    try {
+      const cb = `__GS_CB__${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      let script: HTMLScriptElement | null = null;
+      let timer: number | null = null;
+      const cleanup = () => {
+        try {
+          delete (window as any)[cb];
+        } catch {}
+        if (script && script.parentNode) script.parentNode.removeChild(script);
+        if (timer) window.clearTimeout(timer);
+      };
+      (window as any)[cb] = (data: any) => {
+        cleanup();
+        resolve(data);
+      };
+      const sep = url.includes("?") ? "&" : "?";
+      const src = `${url}${sep}callback=${cb}`;
+      script = document.createElement("script");
+      script.src = src;
+      script.async = true;
+      script.onerror = () => {
+        cleanup();
+        reject(new Error("JSONP error"));
+      };
+      document.body.appendChild(script);
+      timer = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("JSONP timeout"));
+      }, timeoutMs);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+async function loadEndpointStrict(endpoint: string, key?: string): Promise<{ clases: Clase[]; medidas: { id: string; nombre: string; descripcion?: string }[] }> {
+  // 1) Intento normal (fetch CORS)
+  try {
+    const u = key ? `${endpoint}${endpoint.includes("?") ? "&" : "?"}key=${encodeURIComponent(key)}` : endpoint;
+    const r = await fetch(u, { method: "GET", mode: "cors", credentials: "omit" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    return parseStrictData(data);
+  } catch (e) {
+    // 2) Fallback JSONP
+    const data = await jsonpFetch(key ? `${endpoint}${endpoint.includes("?") ? "&" : "?"}key=${encodeURIComponent(key)}` : endpoint);
+    return parseStrictData(data);
+  }
+}
+
+// Carga del estado compartido desde Apps Script (GET con ?action=estado)
+async function loadEstadoShared(endpoint: string, key?: string): Promise<Record<string, EstadoAlumno>> {
+  const extra = key ? `&key=${encodeURIComponent(key)}` : "";
+  const url = `${endpoint}${endpoint.includes("?") ? "&" : "?"}action=estado${extra}`;
+  try {
+    const r = await fetch(url, { method: "GET", mode: "cors", credentials: "omit" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    return data && data.estado ? (data.estado as Record<string, EstadoAlumno>) : {};
+  } catch (e) {
+    try {
+      const data = await jsonpFetch(url);
+      return data && data.estado ? (data.estado as Record<string, EstadoAlumno>) : {};
+    } catch {
+      return {};
+    }
+  }
+}
+
+// Envío de acciones de escritura (POST x-www-form-urlencoded para evitar preflight CORS)
+async function postAccion(endpoint: string, payload: Record<string, string>, key?: string) {
   const body = new URLSearchParams(payload);
-  if (API_KEY) body.append("key", API_KEY);
-  const r = await fetch(ENDPOINT, {
+  if (key) body.append("key", key);
+  const r = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
     body,
@@ -170,9 +253,10 @@ async function postAccion(payload: Record<string, string>) {
   return r.json();
 }
 
-function safePost(payload: Record<string, string>) {
-  if (!ENDPOINT) return Promise.resolve(undefined);
-  return postAccion(payload).catch((err) => {
+// Envoltura segura para evitar "Uncaught (in promise) TypeError: Failed to fetch" en entornos con CORS
+function safePost(endpoint: string, payload: Record<string, string>, key?: string) {
+  if (!endpoint) return Promise.resolve(undefined);
+  return postAccion(endpoint, payload, key).catch((err) => {
     console.warn("postAccion error", err);
     return undefined;
   });
@@ -205,6 +289,7 @@ function Modal({ open, onClose, title, children, description, maxWidth = "max-w-
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50">
+      {/* CLIC FUERA -> CIERRA */}
       <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden />
       <div className="absolute inset-0 flex items-center justify-center p-4">
         <div className={`w-full ${maxWidth} bg-white rounded-xl shadow-xl relative`}>
@@ -456,6 +541,7 @@ function TarjetasAlumnos({
                   {medidasActivas.map((medida) => (
                     <li key={medida.id} className="border border-indigo-200 bg-indigo-50 rounded-lg p-2">
                       <div className="flex items-center justify-between">
+                        {/* Cambio de estilo para el nombre de la medida */}
                         <div className="flex items-center font-medium text-sm">
                           <GreenDot />
                           {medida.nombre}
@@ -515,105 +601,58 @@ function TarjetasAlumnos({
 }
 
 // ==========================================
-// Componente principal de la app
+// Componente FuenteDatos
+// ==========================================
+function FuenteDatos({ show, endpoint, setEndpoint, apiKey, setApiKey, inlineJSON, setInlineJSON, endpointError }:{
+  show: boolean;
+  endpoint: string; setEndpoint: (v: string) => void;
+  apiKey: string; setApiKey: (v: string) => void;
+  inlineJSON: string; setInlineJSON: (v: string) => void;
+  endpointError: string;
+}) {
+  if (!show) return null;
+  return (
+    <div className="rounded-xl border border-slate-200 p-4 bg-slate-50 space-y-4">
+      <div className="space-y-2">
+        <h3 className="font-semibold text-sm">Fuente de datos (Google Apps Script)</h3>
+        <input className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="URL del endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
+        <input className="w-full border rounded-lg px-3 py-2 text-sm" placeholder="Clave API (opcional)" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+        {endpointError && <p className="text-sm text-red-500">{endpointError}</p>}
+      </div>
+      <div className="space-y-2">
+        <h3 className="font-semibold text-sm">Pegar JSON de prueba (modo local)</h3>
+        <textarea className="w-full min-h-[140px] border rounded-lg p-3 text-sm" placeholder="Pega tu JSON aquí..." value={inlineJSON} onChange={(e) => setInlineJSON(e.target.value)} />
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// App (endpoint + opción de pegado para prueba local)
 // ==========================================
 export default function AppMedidas() {
   const [medidas, setMedidas] = useState<{ id: string; nombre: string; descripcion?: string }[]>([]);
   const [clases, setClases] = useState<Clase[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [endpointError, setEndpointError] = useState<string>("");
   
-  // Estado de autenticación
-  const [isAuthReady, setIsAuthReady] = useState(false);
-  const [userId, setUserId] = useState<string | null>(null);
+  // Usamos los valores por defecto del código si no hay nada en el almacenamiento local
+  const [endpoint, setEndpoint] = useState<string>(() => {
+    try {
+      return localStorage.getItem(ENDPOINT_KEY) || DEFAULT_ENDPOINT;
+    } catch {
+      return DEFAULT_ENDPOINT;
+    }
+  });
+  const [inlineJSON, setInlineJSON] = usePersistedState<string>(INLINE_JSON_KEY, "");
+  const [apiKey, setApiKey] = usePersistedState<string>(APIKEY_KEY, DEFAULT_API_KEY);
+  const [usandoPegado, setUsandoPegado] = useState(false);
 
-  // Firestore & Firebase setup
-  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-  const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-  const app = useMemo(() => initializeApp(firebaseConfig), [firebaseConfig]);
-  const db = useMemo(() => getFirestore(app), [app]);
-  const auth = useMemo(() => getAuth(app), [app]);
-  
-  // Real-time state from Firestore
-  const [estado, setEstado] = useState<Record<string, EstadoAlumno>>({});
-
-  // Auth listener
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        setUserId(user.uid);
-      } else {
-        try {
-          // If no user, sign in anonymously or with custom token
-          const signInPromise = typeof __initial_auth_token !== 'undefined'
-            ? signInWithCustomToken(auth, __initial_auth_token)
-            : signInAnonymously(auth);
-          const userCredential = await signInPromise;
-          setUserId(userCredential.user.uid);
-        } catch (e) {
-          setError('Error de autenticación');
-          console.error(e);
-        }
-      }
-      setIsAuthReady(true);
-    });
-    return () => unsub();
-  }, [auth]);
-
-  // Firestore real-time listener
-  useEffect(() => {
-    if (!isAuthReady || !userId) return;
-
-    // Path de la colección para datos compartidos
-    const sharedDataCol = collection(db, "artifacts", appId, "public", "data", "medidas_por_alumno");
-
-    const unsubscribe = onSnapshot(sharedDataCol, (snapshot) => {
-      console.log('Firestore snapshot update.');
-      const changes = snapshot.docChanges();
-      setEstado(prev => {
-        let newState = { ...prev };
-        changes.forEach(change => {
-          if (change.type === 'removed') {
-            delete newState[change.doc.id];
-          } else {
-            newState[change.doc.id] = change.doc.data() as EstadoAlumno;
-          }
-        });
-        return newState;
-      });
-    }, (e) => {
-      console.error("Firestore onSnapshot error:", e);
-      setError("Error al cargar los datos en tiempo real.");
-    });
-
-    return () => unsubscribe();
-  }, [isAuthReady, userId, db, appId]);
-
-  // Load initial data from Google Sheets endpoint
-  useEffect(() => {
-    const load = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const url = `${ENDPOINT}${ENDPOINT.includes("?") ? "&" : "?"}action=init&key=${API_KEY}`;
-        const r = await fetch(url, { method: "GET", mode: "cors", credentials: "omit" });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const data = await r.json();
-        const parsed = parseStrictData(data);
-        setClases(parsed.clases);
-        setMedidas(parsed.medidas);
-      } catch (e: any) {
-        setError("No se pudieron cargar los datos de alumnos y medidas. Revisa la URL del endpoint.");
-        console.error(e);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, []);
-
-  const selectedClassId = useMemo(() => clases.length > 0 ? clases[0].id : "", [clases]);
+  const [selectedClassId, setSelectedClassId] = useState<string>("");
   const clase = useMemo(() => clases.find((c) => c.id === selectedClassId) ?? clases[0], [clases, selectedClassId]);
+  useEffect(() => {
+    if (clases.length)
+      setSelectedClassId((prev) => (clases.some((c) => c.id === prev) ? prev : clases[0].id));
+  }, [clases]);
 
   const [searchAlumno, setSearchAlumno] = useState("");
   const alumnosFiltrados = useMemo(() => {
@@ -622,22 +661,14 @@ export default function AppMedidas() {
     return s ? clase.alumnos.filter((a) => a.nombre.toLowerCase().includes(s)) : clase.alumnos;
   }, [clase, searchAlumno]);
 
+  const [estado, setEstado] = usePersistedState<Record<string, EstadoAlumno>>(STORAGE_KEY, {});
   const getAlumnoEstado = (id: string) => estado[id] ?? { alumnoId: id, medidas: [] };
-
-  const upsertAlumnoEstado = (alumnoId: string, updater: (e: EstadoAlumno) => EstadoAlumno) => {
-    const current = estado[alumnoId] ?? { alumnoId, medidas: [] };
-    const next = updater(current);
-    const docRef = doc(db, "artifacts", appId, "public", "data", "medidas_por_alumno", alumnoId);
-    setDoc(docRef, next)
-      .then(() => {
-        // Sincronizar con Google Sheets
-        safePost({ action: "save", alumno_id: alumnoId, estado_json: JSON.stringify(next) });
-      })
-      .catch((e) => {
-        setError("No se pudo guardar el cambio.");
-        console.error(e);
-      });
-  };
+  const upsertAlumnoEstado = (alumnoId: string, updater: (e: EstadoAlumno) => EstadoAlumno) =>
+    setEstado((prev) => {
+      const curr = prev[alumnoId] ?? { alumnoId, medidas: [] };
+      const next = updater(curr);
+      return { ...prev, [alumnoId]: next };
+    });
 
   const activarMedida = (alumnoId: string, medida: { id: string; nombre: string }) =>
     upsertAlumnoEstado(alumnoId, (e) => applyActivarMedida(e, medida, ahoraISO));
@@ -648,9 +679,66 @@ export default function AppMedidas() {
   const addComentario = (alumnoId: string, medidaId: string, texto: string) =>
     upsertAlumnoEstado(alumnoId, (e) => applyAddComentario(e, medidaId, texto, ahoraISO, uuid));
 
+  // Confirmación de desactivación
   const [confirm, setConfirm] = useState<null | { alumnoId: string; medidaId: string; medidaNombre: string }>(null);
+
+  // UI: fuente de datos y selector
+  const [showFuente, setShowFuente] = useState(false);
   const [showSelectorForAlumno, setShowSelectorForAlumno] = useState<string | null>(null);
 
+  // ----- Carga de datos: fetch -> JSONP -> pegado manual -----
+  useEffect(() => {
+    const load = async () => {
+      setUsandoPegado(false);
+      try {
+        if (!endpoint && !inlineJSON) {
+          setEndpointError("Configura el endpoint o pega un JSON de prueba");
+          setClases([]);
+          setMedidas([]);
+          return;
+        }
+        if (endpoint) {
+          const parsed = await loadEndpointStrict(endpoint, apiKey);
+          setClases(parsed.clases);
+          setMedidas(parsed.medidas);
+          // cargar estado compartido (si existe)
+          try {
+            const shared = await loadEstadoShared(endpoint, apiKey);
+            if (shared && Object.keys(shared).length) setEstado(shared);
+          } catch {}
+          setEndpointError("");
+          return;
+        }
+      } catch (e: any) {
+        setEndpointError(e?.message || "No se pudieron cargar datos del endpoint");
+      }
+      // Fallback: pegado manual
+      try {
+        if (inlineJSON) {
+          const data = JSON.parse(inlineJSON);
+          const parsed = parseStrictData(data);
+          setClases(parsed.clases);
+          setMedidas(parsed.medidas);
+          setUsandoPegado(true);
+          setEndpointError("");
+          return;
+        }
+      } catch (e: any) {
+        setEndpointError("JSON pegado inválido");
+        setClases([]);
+        setMedidas([]);
+      }
+    };
+    load();
+  }, [endpoint, inlineJSON, apiKey, setEstado]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ENDPOINT_KEY, endpoint);
+    } catch {}
+  }, [endpoint]);
+
+  // Informes
   const printAlumno = (al: { id: string; nombre: string }) => {
     const est = getAlumnoEstado(al.id);
     const html = buildAlumnoReportHTML(clase?.nombre || "", al.nombre, est, fmtFecha);
@@ -672,45 +760,54 @@ export default function AppMedidas() {
     downloadBlob(`informe-clase-${clase.nombre.replace(/\s+/g, "_")}.html`, html);
   };
 
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center p-4">
-        <div className="flex flex-col items-center">
-          <svg className="animate-spin h-8 w-8 text-indigo-500 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-          </svg>
-          <p className="text-sm text-slate-500">Cargando datos...</p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-purple-50 p-4 sm:p-8">
       <div className="mx-auto max-w-7xl space-y-6">
+        {/* Top bar */}
         <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-indigo-700">Medidas de intervención educativa</h1>
-            <p className="text-sm text-slate-500 mt-1">Colaboración en tiempo real para el seguimiento de alumnos.</p>
+            <p className="text-sm text-slate-500 mt-1">Selecciona una clase, añade medidas a cada alumno y registra comentarios de seguimiento.</p>
           </div>
           <div className="flex flex-col sm:flex-row sm:items-center gap-2">
             <ReportMenu onPrint={printClase} onDownload={downloadClase} label="Informe de clase" />
+            <button className="border rounded-2xl px-3 py-2 text-sm bg-slate-100 hover:bg-slate-200 transition-colors" onClick={() => setShowFuente((v) => !v)}>⚙️ Fuente de datos</button>
             <div className="flex items-center gap-2">
               <label className="text-sm text-slate-600">📘 Clase</label>
-              <select className="border rounded-2xl px-3 py-2 text-sm bg-white" value={clase?.id || ""} onChange={() => { /* Not implemented to change class */ }}>
+              <select className="border rounded-2xl px-3 py-2 text-sm bg-white" value={clase?.id || ""} onChange={(e) => setSelectedClassId(e.target.value)}>
                 {clases.length === 0 && <option value="">(sin clases)</option>}
                 {clases.map((c) => (
                   <option key={c.id} value={c.id}>{c.nombre}</option>
                 ))}
               </select>
+              {usandoPegado && (
+                <span className="text-xs rounded-full bg-indigo-100 text-indigo-900 px-2 py-1" title="Mostrando datos pegados en local">Fuente: JSON pegado</span>
+              )}
             </div>
           </div>
         </div>
 
-        {error && (
-          <div className="rounded-xl border p-3 text-sm text-slate-700 bg-red-50 border-red-200">
-            <strong>Error:</strong> {error}
+        {/* Panel fuente de datos */}
+        <FuenteDatos
+          show={showFuente}
+          endpoint={endpoint}
+          setEndpoint={setEndpoint}
+          apiKey={apiKey}
+          setApiKey={setApiKey}
+          inlineJSON={inlineJSON}
+          setInlineJSON={setInlineJSON}
+          endpointError={endpointError}
+        />
+
+        {endpoint && !endpointError && clases.length === 0 && (
+          <div className="rounded-xl border p-3 text-sm text-slate-700 bg-amber-50 border-amber-200">
+            No hay clases para mostrar. Revisa que el endpoint devuelva <code>{`{ clases: [...] }`}</code> o usa el pegado manual.
+          </div>
+        )}
+
+        {!endpoint && !inlineJSON && (
+          <div className="rounded-xl border p-3 text-sm text-slate-700 bg-slate-50">
+            Configura el endpoint o pega un JSON en <strong>⚙️ Fuente de datos</strong>.
           </div>
         )}
 
@@ -723,13 +820,16 @@ export default function AppMedidas() {
           alumnos={alumnosFiltrados}
           getAlumnoEstado={getAlumnoEstado}
           fmtFecha={fmtFecha}
-          onAddComentario={(alId, mId, texto) => addComentario(alId, mId, texto)}
+          onAddComentario={(alId, mId, texto) => { safePost(endpoint, { action: "comentar", alumno_id: alId, medida_id: mId, texto }, apiKey); addComentario(alId, mId, texto); }}
           onToggle={(alId, m) => {
+            // Si está activa -> preguntar
             const est = getAlumnoEstado(alId);
             const item = est.medidas.find((x) => x.id === m.id);
             if (item?.activa) {
               setConfirm({ alumnoId: alId, medidaId: m.id, medidaNombre: m.nombre });
             } else {
+              // inactiva -> reactivar sin preguntar
+              safePost(endpoint, { action: "toggle", alumno_id: alId, medida_id: m.id }, apiKey);
               toggleActiva(alId, m.id);
             }
           }}
@@ -739,6 +839,7 @@ export default function AppMedidas() {
         />
       </div>
 
+      {/* Modal de selección de medidas (clic fuera cierra) */}
       <Modal
         open={!!showSelectorForAlumno}
         onClose={() => setShowSelectorForAlumno(null)}
@@ -750,24 +851,29 @@ export default function AppMedidas() {
           onCancel={() => setShowSelectorForAlumno(null)}
           onPick={(m) => {
             if (showSelectorForAlumno) {
-              activarMedida(showSelectorForAlumno, m);
+              const alumnoId = showSelectorForAlumno;
+              safePost(endpoint, { action: "activar", alumno_id: alumnoId, medida_id: m.id, medida_nombre: m.nombre }, apiKey);
+              activarMedida(alumnoId, m);
             }
             setShowSelectorForAlumno(null);
           }}
         />
       </Modal>
 
+      {/* Modal confirmar desactivación */}
       <ConfirmDesactivarModal
         open={!!confirm}
         onClose={() => setConfirm(null)}
         medidaNombre={confirm?.medidaNombre || ""}
         onHistorial={() => {
           if (!confirm) return;
+          safePost(endpoint, { action: "toggle", alumno_id: confirm.alumnoId, medida_id: confirm.medidaId }, apiKey);
           toggleActiva(confirm.alumnoId, confirm.medidaId);
           setConfirm(null);
         }}
         onRemove={() => {
           if (!confirm) return;
+          safePost(endpoint, { action: "remove", alumno_id: confirm.alumnoId, medida_id: confirm.medidaId }, apiKey);
           removeMedida(confirm.alumnoId, confirm.medidaId);
           setConfirm(null);
         }}
